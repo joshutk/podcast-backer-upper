@@ -44,47 +44,91 @@ def get_error_key(error: Exception) -> str:
     return type(error).__name__
 
 
-def handle_error_interactive(error: Exception, context: str, interactive: bool = True) -> bool:
+def handle_error_interactive(error: Exception, context: str, interactive: bool = True) -> str:
     """
     Handle an error interactively, asking user what to do.
-    Returns True if should continue/skip, False if should abort.
-    If interactive=False, always skips (returns True).
+    Returns: 'skip' to skip item, 'skip_all' to skip all of this type,
+             'continue' to proceed without this component, 'abort' to stop.
+    If interactive=False, always returns 'skip_all'.
     """
     error_key = get_error_key(error)
 
     # Non-interactive mode: always skip
     if not interactive:
-        return True
+        return 'skip_all'
 
     # Check if user already made a decision for this error type
     if error_key in _error_decisions:
-        return _error_decisions[error_key] == 'skip_all'
+        return _error_decisions[error_key]
 
     # First occurrence - ask the user
     print(f"\n  ERROR: {error}")
     print(f"  Context: {context}")
     print()
     print("  What would you like to do?")
-    print("  [1] Skip this item and continue")
+    print("  [1] Skip this item entirely and continue")
     print("  [2] Skip all items with this error type")
-    print("  [3] Abort backup")
+    print("  [3] Save metadata anyway (no audio file)")
+    print("  [4] Save metadata for all items with this error")
+    print("  [5] Abort backup")
     print()
 
     while True:
         try:
-            choice = input("  Enter choice (1/2/3): ").strip()
+            choice = input("  Enter choice (1-5): ").strip()
             if choice == '1':
-                return True  # Skip this one, ask again next time
+                return 'skip'
             elif choice == '2':
                 _error_decisions[error_key] = 'skip_all'
-                return True  # Skip all of this type
+                return 'skip_all'
             elif choice == '3':
-                return False  # Abort
+                return 'continue'
+            elif choice == '4':
+                _error_decisions[error_key] = 'continue'
+                return 'continue'
+            elif choice == '5':
+                return 'abort'
             else:
-                print("  Please enter 1, 2, or 3")
+                print("  Please enter 1, 2, 3, 4, or 5")
         except (EOFError, KeyboardInterrupt):
             print("\n  Aborting...")
-            return False
+            return 'abort'
+
+
+def is_likely_audio_url(url: str) -> tuple[bool, str]:
+    """
+    Check if a URL looks like it points to an audio file.
+    Returns (is_valid, reason) tuple.
+    """
+    if not url:
+        return False, "No URL provided"
+
+    url_lower = url.lower()
+
+    # Check for common audio extensions
+    audio_extensions = ('.mp3', '.m4a', '.aac', '.ogg', '.wav', '.flac', '.opus')
+    has_audio_ext = any(ext in url_lower for ext in audio_extensions)
+
+    # Check for suspicious patterns that indicate non-audio pages
+    suspicious_patterns = [
+        ('media.php', 'URL appears to be a PHP page, not an audio file'),
+        ('pageID=', 'URL appears to be a webpage with page ID'),
+        ('.html', 'URL appears to be an HTML page'),
+        ('.htm', 'URL appears to be an HTML page'),
+        ('view=', 'URL appears to be a webpage view'),
+    ]
+
+    for pattern, reason in suspicious_patterns:
+        if pattern in url:
+            return False, reason
+
+    # If no audio extension and no suspicious patterns, it might still be valid
+    # (some CDNs don't use extensions)
+    if not has_audio_ext and '.' in url.split('/')[-1]:
+        # Has some extension but not audio
+        return False, "URL doesn't appear to have an audio file extension"
+
+    return True, "OK"
 
 
 def sanitize_filename(name: str, max_length: int = 100) -> str:
@@ -607,23 +651,54 @@ def backup_podcast(feed_url: str, output_dir: str = None, limit: int = None,
             print("  Warning: No audio URL found, skipping")
             continue
 
+        # Validate URL looks like audio
+        url_valid, url_reason = is_likely_audio_url(ep_data['enclosure_url'])
+        if not url_valid:
+            print(f"  Warning: {url_reason}")
+            print(f"  URL: {ep_data['enclosure_url']}")
+            decision = handle_error_interactive(
+                ValueError(f"Invalid audio URL: {url_reason}"),
+                f"URL validation for: {title}",
+                interactive
+            )
+            if decision == 'abort':
+                print("\nBackup aborted by user.")
+                return False
+            elif decision in ('skip', 'skip_all'):
+                print("  Skipping episode entirely")
+                continue
+            else:  # 'continue' - save metadata without audio
+                print("  Saving metadata only (no audio)")
+                ep_data['audio_missing'] = True
+                ep_data['audio_error'] = f"Invalid URL: {url_reason}"
+                episodes.append(ep_data)
+                continue
+
         # Download audio
+        audio_downloaded = False
         try:
             if skip_existing and audio_path.exists():
                 print("  Audio: already exists, skipping download")
+                audio_downloaded = True
             else:
                 print(f"  Audio: {ep_data['enclosure_url'][:80]}...")
                 download_file(ep_data['enclosure_url'], audio_path)
                 print("  Audio: downloaded")
+                audio_downloaded = True
                 # Be polite to the server
                 time.sleep(0.5)
         except Exception as e:
-            should_continue = handle_error_interactive(e, f"Downloading: {title}", interactive)
-            if not should_continue:
+            decision = handle_error_interactive(e, f"Downloading: {title}", interactive)
+            if decision == 'abort':
                 print("\nBackup aborted by user.")
                 return False
-            print(f"  Audio: SKIPPED - {e}")
-            continue
+            elif decision in ('skip', 'skip_all'):
+                print(f"  Audio: SKIPPED - {e}")
+                continue  # Skip this episode entirely
+            else:  # 'continue' - save metadata without audio
+                print(f"  Audio: FAILED ({e}) - saving metadata only")
+                ep_data['audio_missing'] = True
+                ep_data['audio_error'] = str(e)
 
         # Download episode-specific artwork if different from channel
         ep_artwork_data = channel_artwork_data
@@ -636,24 +711,27 @@ def backup_podcast(feed_url: str, output_dir: str = None, limit: int = None,
             except:
                 pass  # Fall back to channel artwork
 
-        # Embed metadata
-        try:
-            method = embed_metadata(
-                audio_path, ep_data, channel,
-                ep_num, total_episodes, ep_artwork_data
-            )
-            if method == "simple":
-                print("  Metadata: embedded (basic tags only, no artwork)")
-            elif method == "simple_with_art":
-                print("  Metadata: embedded (basic tags + artwork via fallback)")
-            else:
-                print("  Metadata: embedded")
-        except Exception as e:
-            should_continue = handle_error_interactive(e, f"Embedding metadata for: {title}", interactive)
-            if not should_continue:
-                print("\nBackup aborted by user.")
-                return False
-            print(f"  Metadata: SKIPPED - {e}")
+        # Embed metadata (only if we have an audio file)
+        if audio_downloaded:
+            try:
+                method = embed_metadata(
+                    audio_path, ep_data, channel,
+                    ep_num, total_episodes, ep_artwork_data
+                )
+                if method == "simple":
+                    print("  Metadata: embedded (basic tags only, no artwork)")
+                elif method == "simple_with_art":
+                    print("  Metadata: embedded (basic tags + artwork via fallback)")
+                else:
+                    print("  Metadata: embedded")
+            except Exception as e:
+                decision = handle_error_interactive(e, f"Embedding metadata for: {title}", interactive)
+                if decision == 'abort':
+                    print("\nBackup aborted by user.")
+                    return False
+                print(f"  Metadata: SKIPPED - {e}")
+        else:
+            print("  Metadata: saved to manifest (no audio file)")
 
         episodes.append(ep_data)
 
