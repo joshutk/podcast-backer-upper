@@ -25,6 +25,8 @@ from mutagen.id3 import (
     ID3, APIC, TIT2, TPE1, TALB, TYER, TDRC, COMM, TCON, TRCK, TPOS, TXXX, USLT
 )
 from mutagen.mp3 import MP3
+from mutagen.easyid3 import EasyID3
+from mutagen import File as MutagenFile
 
 
 def sanitize_filename(name: str, max_length: int = 100) -> str:
@@ -115,9 +117,9 @@ def get_image_mime_type(url: str) -> str:
     return 'image/jpeg'  # Default to JPEG
 
 
-def embed_metadata(audio_path: Path, episode: dict, channel: dict,
-                   episode_num: int, total_episodes: int, artwork_data: bytes | None):
-    """Embed ID3 tags into an MP3 file."""
+def embed_metadata_full(audio_path: Path, episode: dict, channel: dict,
+                        episode_num: int, total_episodes: int, artwork_data: bytes | None):
+    """Embed full ID3 tags into an MP3 file (may fail on some files)."""
     try:
         audio = MP3(audio_path, ID3=ID3)
     except:
@@ -172,6 +174,47 @@ def embed_metadata(audio_path: Path, episode: dict, channel: dict,
         )
 
     audio.save()
+
+
+def embed_metadata_simple(audio_path: Path, episode: dict, channel: dict,
+                          episode_num: int, total_episodes: int):
+    """Fallback: embed basic metadata using EasyID3 (works on more files, no artwork)."""
+    try:
+        audio = EasyID3(audio_path)
+    except:
+        # Create ID3 tag if none exists
+        audio = MutagenFile(audio_path, easy=True)
+        if audio is None:
+            raise ValueError("Cannot read audio file")
+        audio.add_tags()
+        audio = EasyID3(audio_path)
+
+    audio['title'] = episode.get('title', 'Unknown')
+    audio['artist'] = episode.get('author', channel.get('author', 'Unknown'))
+    audio['album'] = channel.get('title', 'Unknown Podcast')
+    audio['genre'] = channel.get('category', 'Podcast')
+    audio['tracknumber'] = f"{episode_num}/{total_episodes}"
+
+    pub_date = episode.get('published_parsed')
+    if pub_date:
+        audio['date'] = str(pub_date.tm_year)
+
+    audio.save()
+
+
+def embed_metadata(audio_path: Path, episode: dict, channel: dict,
+                   episode_num: int, total_episodes: int, artwork_data: bytes | None):
+    """Embed ID3 tags with fallback for problematic files."""
+    try:
+        embed_metadata_full(audio_path, episode, channel, episode_num, total_episodes, artwork_data)
+        return "full"
+    except Exception as e:
+        # Try simpler fallback (no artwork, but at least basic tags)
+        try:
+            embed_metadata_simple(audio_path, episode, channel, episode_num, total_episodes)
+            return "simple"
+        except Exception as e2:
+            raise Exception(f"Full method: {e}; Simple method: {e2}")
 
 
 def parse_duration(duration_str: str | int | None) -> int | None:
@@ -458,13 +501,21 @@ def backup_podcast(feed_url: str, output_dir: str = None, limit: int = None,
 
     for idx, (entry, ep_data) in enumerate(entries_with_dates, 1):
         ep_num = idx
-        ep_num_padded = str(ep_num).zfill(len(str(total_episodes)))
-
         title = ep_data['title']
         safe_title = sanitize_filename(title, max_length=80)
-        filename = f"{ep_num_padded}-{safe_title}.mp3"
+
+        # Use YYMMDD date prefix for proper sorting
+        pub_date = ep_data.get('published_parsed')
+        if pub_date:
+            date_prefix = f"{pub_date.tm_year % 100:02d}{pub_date.tm_mon:02d}{pub_date.tm_mday:02d}"
+        else:
+            # Fallback to sequential number if no date
+            date_prefix = str(ep_num).zfill(6)
+
+        filename = f"{date_prefix}-{safe_title}.mp3"
         ep_data['local_filename'] = filename
         ep_data['episode_number'] = ep_num
+        ep_data['date_prefix'] = date_prefix
 
         audio_path = episodes_dir / filename
 
@@ -501,11 +552,14 @@ def backup_podcast(feed_url: str, output_dir: str = None, limit: int = None,
 
         # Embed metadata
         try:
-            embed_metadata(
+            method = embed_metadata(
                 audio_path, ep_data, channel,
                 ep_num, total_episodes, ep_artwork_data
             )
-            print("  Metadata: embedded")
+            if method == "simple":
+                print("  Metadata: embedded (basic - no artwork due to file format)")
+            else:
+                print("  Metadata: embedded")
         except Exception as e:
             print(f"  Warning: Could not embed metadata: {e}")
 
