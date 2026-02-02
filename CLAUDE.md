@@ -14,7 +14,8 @@ The project lives in a pCloud-synced folder, which doesn't support symlinks or d
 bash ./backup-podcast "https://example.com/feed.xml"
 bash ./backup-podcast "https://example.com/feed.xml" --limit 10
 bash ./backup-podcast "https://example.com/feed.xml" -o ~/Podcasts/MyShow
-bash ./backup-podcast "https://example.com/feed.xml" --non-interactive
+bash ./backup-podcast "https://example.com/feed.xml" --parallel 4 -y
+bash ./backup-podcast --verify ~/Podcasts/MyShow --repair
 ```
 
 The virtual environment is stored at `~/.local/venvs/podcast-backup` (outside pCloud) and is auto-created by the wrapper script.
@@ -49,6 +50,12 @@ shutil.move(temp_path, dest_path)
 
 ### Interactive Error Handling
 The `_error_decisions` global tracks user choices per error type. `handle_error_interactive()` prompts once per error category, then remembers the decision.
+
+### Parallel Downloads
+Uses `ThreadPoolExecutor` for concurrent downloads. The `download_episode_parallel()` function is thread-safe. Stats tracking uses a `Lock` for thread safety.
+
+### Verify/Repair Mode
+`verify_backup()` checks existing backups: file existence, readability, metadata presence. With `--repair`, it re-embeds metadata for files missing it.
 
 ### Output Structure
 ```
