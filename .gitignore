@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.venv/
+env/
+.env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Downloaded podcast content (don't commit backups)
+*/episodes/
+*/original_feed.xml
+*/manifest.json
+*/import_feed.xml
+*/cover.*
+
+# But allow example/test outputs in specific dirs if needed
+!test_output/.gitkeep
