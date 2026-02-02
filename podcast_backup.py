@@ -28,6 +28,64 @@ from mutagen.mp3 import MP3
 from mutagen.easyid3 import EasyID3
 from mutagen import File as MutagenFile
 
+# Track user decisions for error handling
+_error_decisions = {}  # Maps error type string to 'skip_all' or None
+
+
+def get_error_key(error: Exception) -> str:
+    """Extract a consistent key from an error for grouping similar errors."""
+    error_str = str(error)
+    # Extract the core error message (remove file-specific parts)
+    if "can't sync to" in error_str.lower():
+        return "sync_to_frame"
+    if "not a valid" in error_str.lower():
+        return "invalid_file"
+    # Default: use the exception type
+    return type(error).__name__
+
+
+def handle_error_interactive(error: Exception, context: str, interactive: bool = True) -> bool:
+    """
+    Handle an error interactively, asking user what to do.
+    Returns True if should continue/skip, False if should abort.
+    If interactive=False, always skips (returns True).
+    """
+    error_key = get_error_key(error)
+
+    # Non-interactive mode: always skip
+    if not interactive:
+        return True
+
+    # Check if user already made a decision for this error type
+    if error_key in _error_decisions:
+        return _error_decisions[error_key] == 'skip_all'
+
+    # First occurrence - ask the user
+    print(f"\n  ERROR: {error}")
+    print(f"  Context: {context}")
+    print()
+    print("  What would you like to do?")
+    print("  [1] Skip this item and continue")
+    print("  [2] Skip all items with this error type")
+    print("  [3] Abort backup")
+    print()
+
+    while True:
+        try:
+            choice = input("  Enter choice (1/2/3): ").strip()
+            if choice == '1':
+                return True  # Skip this one, ask again next time
+            elif choice == '2':
+                _error_decisions[error_key] = 'skip_all'
+                return True  # Skip all of this type
+            elif choice == '3':
+                return False  # Abort
+            else:
+                print("  Please enter 1, 2, or 3")
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Aborting...")
+            return False
+
 
 def sanitize_filename(name: str, max_length: int = 100) -> str:
     """Create a safe filename from a string."""
@@ -177,8 +235,8 @@ def embed_metadata_full(audio_path: Path, episode: dict, channel: dict,
 
 
 def embed_metadata_simple(audio_path: Path, episode: dict, channel: dict,
-                          episode_num: int, total_episodes: int):
-    """Fallback: embed basic metadata using EasyID3 (works on more files, no artwork)."""
+                          episode_num: int, total_episodes: int, artwork_data: bytes | None):
+    """Fallback: embed basic metadata using EasyID3, then try to add artwork separately."""
     try:
         audio = EasyID3(audio_path)
     except:
@@ -201,6 +259,25 @@ def embed_metadata_simple(audio_path: Path, episode: dict, channel: dict,
 
     audio.save()
 
+    # Try to add artwork using ID3 directly (may work even when full method fails)
+    artwork_added = False
+    if artwork_data:
+        try:
+            tags = ID3(audio_path)
+            tags['APIC'] = APIC(
+                encoding=3,
+                mime='image/jpeg',
+                type=3,
+                desc='Cover',
+                data=artwork_data
+            )
+            tags.save(audio_path)
+            artwork_added = True
+        except:
+            pass  # Artwork embedding failed, but basic tags are saved
+
+    return artwork_added
+
 
 def embed_metadata(audio_path: Path, episode: dict, channel: dict,
                    episode_num: int, total_episodes: int, artwork_data: bytes | None):
@@ -209,10 +286,10 @@ def embed_metadata(audio_path: Path, episode: dict, channel: dict,
         embed_metadata_full(audio_path, episode, channel, episode_num, total_episodes, artwork_data)
         return "full"
     except Exception as e:
-        # Try simpler fallback (no artwork, but at least basic tags)
+        # Try simpler fallback with artwork attempt
         try:
-            embed_metadata_simple(audio_path, episode, channel, episode_num, total_episodes)
-            return "simple"
+            artwork_added = embed_metadata_simple(audio_path, episode, channel, episode_num, total_episodes, artwork_data)
+            return "simple_with_art" if artwork_added else "simple"
         except Exception as e2:
             raise Exception(f"Full method: {e}; Simple method: {e2}")
 
@@ -431,8 +508,13 @@ def generate_import_feed(channel: dict, episodes: list, output_dir: Path, base_u
 
 
 def backup_podcast(feed_url: str, output_dir: str = None, limit: int = None,
-                   skip_existing: bool = True, generate_import: bool = True):
+                   skip_existing: bool = True, generate_import: bool = True,
+                   interactive: bool = True):
     """Main function to backup a podcast feed."""
+
+    # Reset error decisions for this run
+    global _error_decisions
+    _error_decisions = {}
 
     print(f"Fetching feed: {feed_url}")
     feed = feedparser.parse(feed_url)
@@ -536,7 +618,11 @@ def backup_podcast(feed_url: str, output_dir: str = None, limit: int = None,
                 # Be polite to the server
                 time.sleep(0.5)
         except Exception as e:
-            print(f"  Error downloading audio: {e}")
+            should_continue = handle_error_interactive(e, f"Downloading: {title}", interactive)
+            if not should_continue:
+                print("\nBackup aborted by user.")
+                return False
+            print(f"  Audio: SKIPPED - {e}")
             continue
 
         # Download episode-specific artwork if different from channel
@@ -557,11 +643,17 @@ def backup_podcast(feed_url: str, output_dir: str = None, limit: int = None,
                 ep_num, total_episodes, ep_artwork_data
             )
             if method == "simple":
-                print("  Metadata: embedded (basic - no artwork due to file format)")
+                print("  Metadata: embedded (basic tags only, no artwork)")
+            elif method == "simple_with_art":
+                print("  Metadata: embedded (basic tags + artwork via fallback)")
             else:
                 print("  Metadata: embedded")
         except Exception as e:
-            print(f"  Warning: Could not embed metadata: {e}")
+            should_continue = handle_error_interactive(e, f"Embedding metadata for: {title}", interactive)
+            if not should_continue:
+                print("\nBackup aborted by user.")
+                return False
+            print(f"  Metadata: SKIPPED - {e}")
 
         episodes.append(ep_data)
 
@@ -603,6 +695,8 @@ Examples:
     parser.add_argument('--limit', type=int, help='Limit number of episodes to download (most recent)')
     parser.add_argument('--no-skip', action='store_true', help='Re-download existing files')
     parser.add_argument('--no-import-feed', action='store_true', help='Skip generating import feed')
+    parser.add_argument('--non-interactive', action='store_true',
+                        help='Skip errors without prompting (for automated/background runs)')
 
     args = parser.parse_args()
 
@@ -612,6 +706,7 @@ Examples:
         limit=args.limit,
         skip_existing=not args.no_skip,
         generate_import=not args.no_import_feed,
+        interactive=not args.non_interactive,
     )
 
     sys.exit(0 if success else 1)
